@@ -1,0 +1,6 @@
+pydantic_settings
+fastapi
+uvicorn
+pymupdf
+pillow
+sqlalchemy passlib python-jose[cryptography] arxiv
