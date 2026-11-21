@@ -1,0 +1,14 @@
+# 防止密钥与本地状态进入镜像
+.env
+.git/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.db
+uploads/
+images/
+tunnel_log.txt
+tests/
+*.md
+.dockerignore
+.gitignore

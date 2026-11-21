@@ -1,6 +1,37 @@
-pydantic_settings
+# ---- Core web layer ----
 fastapi
-uvicorn
+uvicorn[standard]
+python-multipart
+pydantic-settings
+
+# ---- Config ----
+python-dotenv
+
+# ---- Auth / Session ----
+# passlib 1.7.4 探测 bcrypt 版本的方式在 bcrypt>=5 下失效，钉住 4.x
+passlib[bcrypt]
+bcrypt<5
+python-jose[cryptography]
+
+# ---- Parsing & Imaging (Layer 6) ----
 pymupdf
 pillow
-sqlalchemy passlib python-jose[cryptography] arxiv
+
+# ---- Data source ----
+arxiv
+
+# ---- Connection guardian (tunnel watchdog) ----
+# connection_guardian.py 直接 import requests，之前没进清单，新环境会缺包
+requests
+
+# ---- Data & Cache layer (Layer 7): Redis 缓存 + 任务队列 ----
+# 未安装本地 Redis 时，app/core/store.py 会自动降级为进程内存实现，服务仍可启动
+redis
+
+# ---- Async HTTP (替代阻塞式 requests) ----
+httpx
+
+# ---- Tests ----
+pytest
+# 内存实现 Redis 协议语义，队列测试无需本机起 Redis
+fakeredis

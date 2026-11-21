@@ -1,0 +1,72 @@
+# Scholar Vision v2.0
+# 一键起 后端 API + Redis + 分析 worker。
+#
+# 用法：
+#   docker compose up --build          # 三个服务一起起
+#   浏览器访问 http://localhost:8000
+#   worker 日志：docker compose logs -f worker
+#
+# 文件共享说明（两进程架构的关键）：
+#   API 把上传的 PDF 写进 uploads/、worker 从这里读取并往 images/ 抽图，
+#   两个进程必须看到同一份文件系统 —— 所以下面用命名 volume 把 uploads/
+#   和 images/ 同时挂给 api 和 worker。改成多机部署时这两目录要换共享存储。
+#
+# 本机不想用 Docker 跑 Redis 时：直接 python -m uvicorn app.main:app 也能跑，
+# app/core/store.py 探测不到 Redis 会自动降级，任务退回 API 进程内执行。
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: sv-redis
+    restart: unless-stopped
+    # appendonly 打开后缓存/队列可跨重启保留（默认关闭时 Redis 重启即清空）
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: .
+    container_name: sv-api
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      COOKIE_SECURE: "false"
+    ports:
+      - "8000:8000"
+    volumes:
+      - uploads-data:/app/uploads
+      - images-data:/app/images
+
+  worker:
+    build: .
+    container_name: sv-worker
+    restart: unless-stopped
+    command: ["python", "worker.py"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      # 与 api 完全相同的两个共享卷 —— 缺一个 worker 就找不到上传的文件
+      - uploads-data:/app/uploads
+      - images-data:/app/images
+
+volumes:
+  redis-data:
+  uploads-data:
+  images-data:

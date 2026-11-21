@@ -220,4 +220,16 @@ __marimo__/
 .streamlit/secrets.toml
 
 .env
+.env.*
+!.env.example
 tunnel_log.txt
+guardian_out.txt
+guardian_err.txt
+launcher_out.txt
+uploads/
+
+# Local binaries and runtime artifacts (do not commit)
+cloudflared.exe
+*.exe
+scholar_vision.db
+*.db-journal
