@@ -127,7 +127,9 @@
     <canvas id="particle-canvas"></canvas>
 
     <!-- 顶部登录/注册极简入口 -->
-    <div class="fixed top-4 right-4 z-50 flex gap-3">
+    <div class="fixed top-4 right-4 z-50 flex gap-3 items-center">
+        <span id="auth-badge" class="text-xs font-mono text-green-400 hidden"></span>
+        <a href="/dashboard" class="text-xs font-mono text-slate-400 border border-slate-500/30 px-3 py-1 rounded hover:bg-slate-500/10 transition">[ HISTORY ]</a>
         <button onclick="toggleAuthModal()" class="text-xs font-mono text-cyan-400 border border-cyan-400/30 px-3 py-1 rounded bg-cyan-400/10 hover:bg-cyan-400/20 transition">
             [ SYSTEM_AUTH ]
         </button>
@@ -289,6 +291,56 @@
     <div id="touch-glow"></div>
 
     <script>
+        // ================= 0. v2.0：会话与 401 统一处理 =================
+        const _rawFetch = window.fetch.bind(window);
+
+        // 任何接口返回 401（未登录/会话过期）→ 自动弹出 SYSTEM_AUTH
+        window.fetch = async function (input, init) {
+            const res = await _rawFetch(input, init);
+            const modal = document.getElementById('auth-modal');
+            if (res.status === 401 && modal.classList.contains('hidden')) {
+                openAuthModal('需要登录后才能继续');
+            }
+            return res;
+        };
+
+        function openAuthModal(msg) {
+            const modal = document.getElementById('auth-modal');
+            modal.classList.remove('hidden');
+            resetAuthForm();
+            isLoginMode = true;
+            updateAuthUI();
+            if (msg) {
+                const m = document.getElementById('auth-msg');
+                m.className = "text-center text-xs mt-4 font-mono text-yellow-400";
+                m.innerText = "⚠️ " + msg;
+            }
+        }
+
+        // 网关 302 回主页时带 ?auth=required&next=… → 弹窗，登录成功后送回原页面
+        async function checkAuthEntry() {
+            const params = new URLSearchParams(location.search);
+            if (params.get('auth') === 'required') {
+                window.__authNext = params.get('next') || '/';
+                openAuthModal('请先登录以访问该页面');
+                history.replaceState({}, '', '/');
+            }
+            await refreshAuthBadge();
+        }
+
+        async function refreshAuthBadge() {
+            const badge = document.getElementById('auth-badge');
+            const res = await _rawFetch('/auth/me');   // 原始 fetch，避免 401 递归弹窗
+            if (res.ok) {
+                const data = await res.json();
+                badge.innerText = `[ AUTH:${data.username} ]`;
+                badge.classList.remove('hidden');
+                return true;
+            }
+            badge.classList.add('hidden');
+            return false;
+        }
+
         // ================= 1. 粒子背景动画 =================
         const canvas = document.getElementById('particle-canvas');
         const ctx = canvas.getContext('2d');
@@ -370,11 +422,15 @@
         const terminalLog = document.getElementById('terminal-log');
         const aiOutput = document.getElementById('ai-output');
 
-        const logSteps = [
-            "[SYS] Initializing pipeline...", "[FILE] Uploading PDF stream...",
-            "[PYMUPDF] Parsing document...", "[PILLOW] Compressing images...",
-            "[NET] Connecting to Intern-S2...", "[VLM] Analyzing charts...", "[SYS] Formatting JSON..."
-        ];
+        let pollTimer = null;
+
+        function appendLog(text, cls) {
+            const div = document.createElement('div');
+            div.className = 'mb-1 ' + (cls || '');
+            div.innerHTML = `<span class="text-slate-500">></span> ${text}`;
+            terminalLog.appendChild(div);
+            terminalLog.parentElement.scrollTop = 999999;
+        }
 
         uploadZone.addEventListener('dragover', (e) => { e.preventDefault(); uploadZone.classList.add('scale-105'); });
         uploadZone.addEventListener('dragleave', () => { uploadZone.classList.remove('scale-105'); });
@@ -388,49 +444,99 @@
 
         async function handleUpload(event) {
             const file = event.target.files[0];
-            if (!file || !file.name.endsWith('.pdf')) return alert("Please upload a PDF file.");
+            if (!file || !file.name.toLowerCase().endsWith('.pdf')) return alert("Please upload a PDF file.");
 
             uploadZone.classList.add('hidden');
             loadingZone.classList.remove('hidden');
             terminalLog.innerHTML = '';
             document.getElementById('module-search').classList.add('hidden');
-
-            let logIndex = 0;
-            const logInterval = setInterval(() => {
-                if (logIndex < logSteps.length) {
-                    const div = document.createElement('div');
-                    div.className = 'mb-1';
-                    div.innerHTML = `<span class="text-slate-500">></span> ${logSteps[logIndex]}`;
-                    terminalLog.appendChild(div); logIndex++;
-                }
-            }, 2500);
+            appendLog('[SYS] Submitting job to pipeline...');
 
             const formData = new FormData();
             formData.append("file", file);
 
             try {
                 const response = await fetch('/api/analyze', { method: 'POST', body: formData });
-                clearInterval(logInterval);
-                if (!response.ok) throw new Error("Pipeline execution failed.");
-                const data = await response.json();
-
-                document.getElementById('meta-img').innerText = data.analyzed_image;
-                document.getElementById('meta-len').innerText = `${data.extracted_text_length} chars`;
-                
-                loadingZone.classList.add('hidden');
-                resultZone.classList.remove('hidden');
-
-                if (window.innerWidth < 768) {
-                    aiOutput.innerHTML = marked.parse(data.vlm_result);
-                } else {
-                    typeWriter(marked.parse(data.vlm_result), aiOutput, 10);
+                if (response.status === 401) { resetApp(); return; }
+                if (!response.ok) {
+                    const err = await response.json().catch(() => ({}));
+                    throw new Error(err.detail || `Pipeline submission failed (${response.status}).`);
                 }
+                const submit = await response.json();
+
+                // 缓存命中：后端直接带回结果，无需排队
+                if (submit.cached && submit.result) {
+                    appendLog('🎯 [CACHE] Hit! Served from Redis cache.', 'text-purple-400');
+                    renderResult(submit.result);
+                    return;
+                }
+                pollJob(submit.job_id);
             } catch (error) {
-                clearInterval(logInterval); alert("❌ Error: " + error.message); resetApp();
+                alert("❌ Error: " + error.message);
+                resetApp();
+            }
+        }
+
+        // 轮询后台任务：进度来自服务端真实计数，不再靠前端猜时间
+        function pollJob(jobId) {
+            let lastDone = -1;
+            pollTimer = setInterval(async () => {
+                try {
+                    const res = await fetch(`/api/tasks/${jobId}`);
+                    if (!res.ok) throw new Error('任务状态已丢失');
+                    const job = await res.json();
+
+                    if (job.status === 'queued') {
+                        appendLog('[QUEUE] Waiting for a worker slot...', 'text-yellow-400');
+                    } else if (job.status === 'running') {
+                        const p = job.progress || { done: 0, total: 0 };
+                        if (p.done !== lastDone) {
+                            appendLog(`[VLM] Chart analysis: ${p.done}/${p.total}`, 'text-green-400');
+                            lastDone = p.done;
+                        }
+                    } else if (job.status === 'completed') {
+                        stopPolling();
+                        renderResult(job.result);
+                    } else {
+                        stopPolling();
+                        throw new Error(job.error || `任务已${job.status === 'cancelled' ? '取消' : '失败'}`);
+                    }
+                } catch (error) {
+                    stopPolling();
+                    alert("❌ Error: " + error.message);
+                    resetApp();
+                }
+            }, 2000);
+        }
+
+        function stopPolling() {
+            if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        }
+
+        function renderResult(result) {
+            if (!result || result.status !== 'success') {
+                appendLog('[WARN] ' + (result && result.message ? result.message : '无可用结果'), 'text-yellow-400');
+                setTimeout(resetApp, 1800);
+                return;
+            }
+            document.getElementById('meta-img').innerText = result.analyzed_image;
+            document.getElementById('meta-len').innerText = `${result.extracted_text_length} chars`;
+            if (result.images_total !== undefined) {
+                appendLog(`[DONE] Analyzed ${result.images_ok}/${result.images_total} charts`, 'text-cyan-400');
+            }
+
+            loadingZone.classList.add('hidden');
+            resultZone.classList.remove('hidden');
+
+            if (window.innerWidth < 768) {
+                aiOutput.innerHTML = marked.parse(result.vlm_result);
+            } else {
+                typeWriter(marked.parse(result.vlm_result), aiOutput, 10);
             }
         }
 
         function resetApp() {
+            stopPolling();
             fileInput.value = "";
             uploadZone.classList.remove('hidden');
             loadingZone.classList.add('hidden');
@@ -462,26 +568,47 @@
         }
 
         // ================= 4. ArXiv 搜索逻辑 =================
+        function escapeHtml(value) {
+            return String(value == null ? '' : value)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+
+        // 只放行 https 链接：论文数据来自外部 API，不能把任意字符串直接写进 href
+        function safeHttpsUrl(rawUrl) {
+            try {
+                const u = new URL(rawUrl, location.origin);
+                return u.protocol === 'https:' ? u.href : '#';
+            } catch (e) { return '#'; }
+        }
+
         async function searchArxiv() {
             const query = document.getElementById('search-input').value;
             const resultsDiv = document.getElementById('search-results');
             if (!query) return;
-            
+
             resultsDiv.innerHTML = '<div class="text-cyan-400 font-mono animate-pulse">Searching arXiv...</div>';
-            
+
             try {
                 const res = await fetch(`/api/search?keyword=${encodeURIComponent(query)}`);
+                if (!res.ok) {
+                    resultsDiv.innerHTML = `<div class="text-red-400 font-mono">${res.status === 401 ? '请先登录' : '搜索失败'}</div>`;
+                    return;
+                }
                 const data = await res.json();
-                
+
                 resultsDiv.innerHTML = '';
+                if (data.cached) {
+                    resultsDiv.innerHTML = '<div class="text-purple-400 font-mono text-xs mb-2">🎯 served from Redis cache</div>';
+                }
                 if (data.results && data.results.length > 0) {
                     data.results.forEach(paper => {
                         const item = document.createElement('div');
                         item.className = "bg-slate-800/50 border border-slate-700 p-4 rounded-lg";
                         item.innerHTML = `
-                            <a href="${paper.pdf_url}" target="_blank" class="text-cyan-400 font-bold hover:underline text-lg block mb-2">${paper.title}</a>
-                            <div class="text-xs text-slate-500 font-mono mb-2">${paper.published}</div>
-                            <p class="text-sm text-slate-300 line-clamp-3">${paper.summary}</p>
+                            <a href="${safeHttpsUrl(paper.pdf_url)}" target="_blank" rel="noopener noreferrer" class="text-cyan-400 font-bold hover:underline text-lg block mb-2">${escapeHtml(paper.title)}</a>
+                            <div class="text-xs text-slate-500 font-mono mb-2">${escapeHtml(paper.published)}</div>
+                            <p class="text-sm text-slate-300 line-clamp-3">${escapeHtml(paper.summary)}</p>
                         `;
                         resultsDiv.appendChild(item);
                     });
@@ -551,27 +678,33 @@
             }
 
             const endpoint = isLoginMode ? '/auth/login' : '/auth/register';
-            
+
             try {
                 const res = await fetch(endpoint, {
-                    method: 'POST', 
+                    method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username: user, password: pass })
+                    body: JSON.stringify({ username: user, password: pass }),
+                    credentials: 'same-origin'
                 });
                 const data = await res.json();
-                
+
                 if (res.ok) {
                     msg.className = "text-center text-xs mt-4 font-mono text-green-400";
                     if (isLoginMode) {
-                        msg.innerText = "✅ Login Successful! Access Granted.";
-                        localStorage.setItem('token', data.access_token);
-                        setTimeout(() => toggleAuthModal(), 1000);
+                        // v2.0：token 由服务端写入 httpOnly Cookie，JS 不再持有
+                        msg.innerText = "✅ Login Successful! Session granted.";
+                        await refreshAuthBadge();
+                        const backTo = window.__authNext;
+                        setTimeout(() => {
+                            document.getElementById('auth-modal').classList.add('hidden');
+                            if (backTo && backTo !== '/') location.href = backTo;
+                        }, 900);
                     } else {
                         msg.innerText = "✅ Registration Successful! Please Login.";
-                        setTimeout(() => { switchAuthMode(); }, 1500); 
+                        setTimeout(() => { switchAuthMode(); }, 1500);
                     }
-                } else { 
-                    throw new Error(data.detail || "Auth failed"); 
+                } else {
+                    throw new Error(data.detail || "Auth failed");
                 }
             } catch (e) {
                 msg.className = "text-center text-xs mt-4 font-mono text-red-400";
@@ -644,6 +777,13 @@
                 tiltCard.style.transform = `rotateX(${rotateX}deg) rotateY(${rotateY}deg)`;
             });
             uploadContainer.addEventListener('mouseleave', () => { tiltCard.style.transform = `rotateX(0) rotateY(0)`; });
+        }
+
+        // ================= 7. v2.0 启动钩子：处理网关重定向标记 =================
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', checkAuthEntry);
+        } else {
+            checkAuthEntry();
         }
     </script>
 </body>

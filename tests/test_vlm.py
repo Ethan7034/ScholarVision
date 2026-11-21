@@ -4,7 +4,6 @@ import os
 # 强行把上一级目录加入到系统路径中，防止找不到 app 模块
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# 注意这里！函数名改了！加上 _with_fallback
 from app.pipelines.llm_client import analyze_chart
 
 if __name__ == "__main__":
